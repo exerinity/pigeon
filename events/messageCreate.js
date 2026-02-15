@@ -381,6 +381,16 @@ const sendChunkedReply = async (message, chunks, finalTag) => {
 
 const handleFailure = async (message, error) => {
     console.error(`Error processing AI response: ${error}`);
+    const quotaExceeded =
+        error?.response?.error?.code === 429 ||
+        error?.response?.error?.status === 'RESOURCE_EXHAUSTED' ||
+        /quota/i.test(error?.message || '');
+
+    if (quotaExceeded) {
+        await message.reply(':x: Too many requests, try again later?').catch(() => {});
+        return;
+    }
+
     let errorMsg = `Error:\n||\`${error.message || error}\`||`;
     if (error.response?.error) {
         errorMsg += `\nAPI Error: ||\`\`\`${JSON.stringify(error.response.error, null, 2)}\`\`\`||`;
