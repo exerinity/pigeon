@@ -17,6 +17,8 @@ const xaiClient = createXai({ apiKey: XAI_API_KEY });
 
 const MODEL_ID = 'grok-4-fast';
 const MODEL_DISPLAY_NAME = 'Grok 4 Fast';
+const grokModel = xaiClient.responses(MODEL_ID);
+const webSearchTool = xaiClient.tools.webSearch();
 const BLOCKED_USER_IDS = new Set([
     process.env.DICKHEADS // dont mind my fruity naming schemes
 ]);
@@ -71,6 +73,11 @@ const pushToHistory = (buffer, entry) => {
     while (buffer.length > HISTORY_LIMIT) {
         buffer.shift();
     }
+};
+
+const wrapInlineCitations = (text) => {
+    if (!text) return text;
+    return text.replace(/\[\[(\d+)\]\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => `[[${label}]](<${url}>)`);
 };
 
 const buildSystemPrompt = (message) => {
@@ -205,11 +212,14 @@ const buildMessagesPayload = async ({
 };
 
 const callGrok = async ({ systemPrompt, messages }) => generateText({
-    model: xaiClient(MODEL_ID),
+    model: grokModel,
     system: systemPrompt,
     messages,
     temperature: 1.2,
-    maxOutputTokens: 1024
+    maxOutputTokens: 1024,
+    tools: {
+        web_search: webSearchTool
+    }
 });
 
 const buildFinalTag = (elapsedMs, usage) => {
@@ -375,6 +385,8 @@ module.exports = {
 
                 botResponse = fallbackText || "Hmm, got an empty response from the model. Try again?";
             }
+
+            botResponse = wrapInlineCitations(botResponse);
 
             if (!isBotMention) {
                 const historyBuffer = ensureHistoryBuffer(userMessageHistory, historyKey, userId);
