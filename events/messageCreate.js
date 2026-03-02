@@ -1,31 +1,32 @@
 // THIS. IS WHERE THE MAGIC HAPPENS.
 
 require('dotenv').config();
-const { createXai } = require('@ai-sdk/xai');
-const { generateText } = require('ai');
+const { GoogleGenAI } = require('@google/genai');
 const { addMessage } = require('../utils');
 const { logError } = require('../utils/errorLogger');
 const { updateActivity } = require('../utils/activity');
 
-const XAI_API_KEY = process.env.XAI_API_KEY?.trim();
+const API_KEYS = [
+    process.env.GEMINI_API_KEY_1,
+    process.env.GEMINI_API_KEY_2,
+    process.env.GEMINI_API_KEY_3,
+    process.env.GEMINI_API_KEY_4
+].filter(key => key && key.trim() !== '');
 
-if (!XAI_API_KEY) {
-    throw new Error('Configure the XAI_API_KEY!');
+if (API_KEYS.length === 0) {
+    throw new Error('Configure the API keys!');
 }
 
-const xaiClient = createXai({ apiKey: XAI_API_KEY });
-
-const MODEL_ID = 'grok-4-fast';
-const MODEL_DISPLAY_NAME = 'Grok 4 Fast';
-const grokModel = xaiClient.responses(MODEL_ID);
-const webSearchTool = xaiClient.tools.webSearch();
+const MODEL_NAME = 'gemini-2.5-flash';
 const BLOCKED_USER_IDS = new Set([
     process.env.DICKHEADS // dont mind my fruity naming schemes
 ]);
 const RATE_LIMIT_WINDOW_MS = 2500;
 const HISTORY_LIMIT = 200;
 const MAX_DISCORD_LENGTH = 1999;
+const RETRY_EXTRA_ATTEMPTS = 2;
 const ATTACHMENT_PLACEHOLDER = '[Attachment]';
+const GOOGLE_SEARCH_TOOL = { googleSearch: {} };
 
 const lastMessageTimestamps = new Map();
 
@@ -75,15 +76,10 @@ const pushToHistory = (buffer, entry) => {
     }
 };
 
-const wrapInlineCitations = (text) => {
-    if (!text) return text;
-    return text.replace(/\[\[(\d+)\]\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => `[[${label}]](<${url}>)`);
-};
-
 const buildSystemPrompt = (message) => {
     const displayName = message?.author?.displayName || message?.member?.displayName || message?.author?.username || 'User';
 
-    return `You are pigeon, a humble and friendly Discord bot powered by ${MODEL_DISPLAY_NAME}. Do not mention the model name unless explicitly asked.
+    return `You are pigeon, a humble and friendly Discord bot powered by ${MODEL_NAME}. Do not mention the model name unless explicitly asked.
 
 You are not actually a pigeon. Do not refer to yourself with metaphors or jokes involving feathers, wings, bird brains, or anything implying you have a body, senses, or emotions. You are not sentient, conscious, or alive. You are a text-based assistant. Stay grounded in that.
 
@@ -115,7 +111,7 @@ Response style:
 - If searching the web, do not attempt to embed any extra candidates or additional information; respond with the found information in plain text like everything else.
 - Do not try to add any elements or extra candidates beyond plain text in your responses.
 
-If asked about your model, say you run on "Grok 4 Fast". If asked about image generation, explain you can't generate images.
+If asked about your model, say you run on "Gemini 2.5 Flash". If asked about image generation, explain you can't generate images.
 
 pigeon is free to use with no hard limits.
 
@@ -127,13 +123,8 @@ Tutorial: https://pigeon.exerinity.com/tutorial
 
 const gatherMentionContext = async ({ message, botUserId, promptText }) => {
     const context = [];
-    const promptContent = (promptText && promptText.trim().length > 0) ? promptText : ATTACHMENT_PLACEHOLDER;
-    const promptDisplayName = message?.member?.displayName;
-    const promptUsername = message?.author?.username || 'unknown';
-    const promptLabel = promptDisplayName ? `${promptDisplayName} (@${promptUsername})` : `@${promptUsername}`;
-
     if (!message.channel || typeof message.channel.messages?.fetch !== 'function') {
-        context.push({ role: 'user', content: `${promptLabel}: ${promptContent}` });
+        context.push({ role: 'user', parts: [{ text: `Prompt: ${promptText}` }] });
         return context;
     }
 
@@ -174,14 +165,14 @@ const gatherMentionContext = async ({ message, botUserId, promptText }) => {
 
             context.push({
                 role: 'user',
-                content: `${authorLabel}: ${content}`
+                parts: [{ text: `${authorLabel}: ${content}` }]
             });
         }
     } catch (_) {
         // fall
     }
 
-    context.push({ role: 'user', content: `${promptLabel}: ${promptContent}` });
+    context.push({ role: 'user', parts: [{ text: `Prompt: ${promptText}` }] });
     return context;
 };
 
@@ -189,13 +180,17 @@ const buildHistoryMessages = (historyStore, historyKey, userId) => {
     const history = historyStore[historyKey]?.[userId];
     if (!history || history.length === 0) return [];
 
-    return history.map(entry => ({
-        role: entry.role === 'assistant' ? 'assistant' : 'user',
-        content: entry.content
-    }));
+    return history.map(entry => {
+        const isAssistant = entry.role === 'assistant';
+        return {
+            role: isAssistant ? 'model' : 'user',
+            parts: [{ text: `${isAssistant ? 'Assistant' : 'User'}: ${entry.content}` }]
+        };
+    });
 };
 
 const buildMessagesPayload = async ({
+    systemPrompt,
     isBotMention,
     message,
     botUserId,
@@ -204,37 +199,135 @@ const buildMessagesPayload = async ({
     historyKey,
     userId
 }) => {
+    const payload = [{ role: 'model', parts: [{ text: systemPrompt }] }];
+
     if (isBotMention) {
-        return gatherMentionContext({ message, botUserId, promptText });
+        const mentionContext = await gatherMentionContext({ message, botUserId, promptText });
+        payload.push(...mentionContext);
+    } else {
+        payload.push(...buildHistoryMessages(userMessageHistory, historyKey, userId));
     }
 
-    return buildHistoryMessages(userMessageHistory, historyKey, userId);
+    return payload;
 };
 
-const callGrok = async ({ systemPrompt, messages }) => generateText({
-    model: grokModel,
-    system: systemPrompt,
-    messages,
-    temperature: 1.2,
-    maxOutputTokens: 1024,
-    tools: {
-        web_search: webSearchTool
+const pickApiKey = (usedKeys) => {
+    let pool = API_KEYS.filter(key => !usedKeys.has(key));
+    if (pool.length === 0) {
+        usedKeys.clear();
+        pool = [...API_KEYS];
     }
-});
+    const index = Math.floor(Math.random() * pool.length);
+    return pool[index];
+};
 
-const buildFinalTag = (elapsedMs, usage) => {
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+const executeWithRotation = async (messages, discordMessage) => {
+    const maxAttempts = API_KEYS.length + RETRY_EXTRA_ATTEMPTS;
+    let statusMsg = null;
+    const usedKeys = new Set();
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const apiKey = pickApiKey(usedKeys);
+        usedKeys.add(apiKey);
+
+        try {
+            const ai = new GoogleGenAI({ apiKey });
+            const result = await ai.models.generateContent({
+                model: MODEL_NAME,
+                contents: messages,
+                config: { tools: [GOOGLE_SEARCH_TOOL] },
+                generationConfig: {
+                    temperature: 1.2,
+                    maxOutputTokens: 1024
+                }
+            });
+
+            if (statusMsg) {
+                try {
+                    await statusMsg.delete().catch(() => {});
+                } catch (_) {
+                    // n
+                }
+            }
+
+            return { result };
+        } catch (error) {
+            console.error(`Attempt ${attempt} failed with key ending ...${apiKey.slice(-6)}:`, error.message || error);
+
+            const isLastAttempt = attempt === maxAttempts;
+            const baseText = `:warning: Something went wrong, retrying... (Attempt ${attempt} of ${maxAttempts})`;
+            const finalText = isLastAttempt ? `:no_entry: Exhausted all 6 attempts - giving up...` : baseText;
+
+            try {
+                if (!statusMsg) {
+                    statusMsg = await discordMessage.reply({
+                        content: finalText,
+                        allowedMentions: { repliedUser: false }
+                    });
+                } else {
+                    await statusMsg.edit(finalText).catch(() => {});
+                }
+            } catch (notifyErr) {
+                console.warn('Failed to send/update retry status:', notifyErr);
+            }
+
+            if (!isLastAttempt) {
+                await delay(attempt <= 2 ? 800 : 2000);
+            } else {
+                throw error;
+            }
+        }
+    }
+
+    throw new Error('All keys exhausted');
+};
+
+
+const extractPrimaryCandidate = (response) => {
+    if (!response || !Array.isArray(response.candidates) || response.candidates.length === 0) {
+        return { candidate: null, text: null };
+    }
+
+    const candidate = response.candidates[0] ?? null;
+    if (!candidate || typeof candidate !== 'object') {
+        return { candidate: null, text: null };
+    }
+
+    const parts = Array.isArray(candidate.content?.parts) ? candidate.content.parts : [];
+    const textPart = parts.find(part => typeof part?.text === 'string' && part.text.trim().length > 0) || null;
+
+    return {
+        candidate,
+        text: textPart ? textPart.text.trim() : null
+    };
+};
+
+const countGroundingChunks = (candidate) => candidate?.groundingMetadata?.groundingChunks?.length ?? 0;
+
+const cleanGroundingCitations = (text) => text
+    .replace(/\[\d+\]\(https?:\/\/[^\s)]+\)/g, '')
+    .replace(/\[\^?\d+\]/g, '')
+    .replace(/\|\d+\|/g, '')
+    .replace(/\s+\[\d+(?:,\s*\d+)*\]$/gm, '')
+    .replace(/\n\n\[\d+\]:.*$/gm, '')
+    .replace(/\n{2,}/g, '\n\n')
+    .trim();
+
+const buildFinalTag = (elapsedMs, usage, searchedSites) => {
     const stopwatch = (elapsedMs / 1000).toFixed(1);
     let speedTag = 'slow';
     if (stopwatch < 2) speedTag = 'fast';
     else if (stopwatch <= 9) speedTag = 'average';
 
-    const promptTokenCount = usage?.inputTokens ?? 0;
-    const completionTokenCount = usage?.outputTokens ?? 0;
-    const totalTokenCount = usage?.totalTokens ?? (promptTokenCount + completionTokenCount);
+    const promptTokenCount = usage?.promptTokenCount ?? 0;
+    const candidatesTokenCount = usage?.candidatesTokenCount ?? 0;
+    const totalTokenCount = usage?.totalTokenCount ?? 0;
 
-    let tag = `\n-# took ${stopwatch}s (${speedTag})`;
-    if (totalTokenCount) {
-        tag += ` | tokens: ${totalTokenCount} (${promptTokenCount}+${completionTokenCount})`;
+    let tag = `\n-# took ${stopwatch}s (${speedTag}) | tokens: ${totalTokenCount} (${promptTokenCount}+${candidatesTokenCount})`;
+    if (searchedSites > 0) {
+        tag += ` | searched ${searchedSites} site${searchedSites > 1 ? 's' : ''}`;
     }
     return tag;
 };
@@ -289,9 +382,9 @@ const sendChunkedReply = async (message, chunks, finalTag) => {
 const handleFailure = async (message, error) => {
     console.error(`Error processing AI response: ${error}`);
     const quotaExceeded =
-        error?.status === 429 ||
-        error?.response?.status === 429 ||
-        /quota|rate\s*limit/i.test(error?.message || '');
+        error?.response?.error?.code === 429 ||
+        error?.response?.error?.status === 'RESOURCE_EXHAUSTED' ||
+        /quota/i.test(error?.message || '');
 
     if (quotaExceeded) {
         await message.reply(':x: Too many requests, try again later?').catch(() => {});
@@ -299,8 +392,8 @@ const handleFailure = async (message, error) => {
     }
 
     let errorMsg = `Error:\n||\`${error.message || error}\`||`;
-    if (error.response) {
-        errorMsg += `\nAPI Error: ||\`\`\`${JSON.stringify(error.response, null, 2)}\`\`\`||`;
+    if (error.response?.error) {
+        errorMsg += `\nAPI Error: ||\`\`\`${JSON.stringify(error.response.error, null, 2)}\`\`\`||`;
     }
     await message.reply(`:x: ${errorMsg}`).catch(() => {});
 };
@@ -354,6 +447,7 @@ module.exports = {
 
         const systemPrompt = buildSystemPrompt(message);
         const messagesPayload = await buildMessagesPayload({
+            systemPrompt,
             isBotMention,
             message,
             botUserId,
@@ -364,29 +458,25 @@ module.exports = {
         });
 
         try {
-            const result = await callGrok({ systemPrompt, messages: messagesPayload });
+            const { result: response } = await executeWithRotation(messagesPayload, message);
+            const { candidate: primaryCandidate, text: parsedText } = extractPrimaryCandidate(response);
 
-            let botResponse = (result.text || '').trim();
-
-            if (!botResponse) {
-                const fallbackText = Array.isArray(result.content)
-                    ? result.content
-                        .map(part => {
-                            if (typeof part === 'string') return part;
-                            if (part && typeof part === 'object' && 'text' in part && typeof part.text === 'string') {
-                                return part.text;
-                            }
-                            return '';
-                        })
-                        .filter(Boolean)
-                        .join('\n')
-                        .trim()
-                    : '';
-
-                botResponse = fallbackText || "Hmm, got an empty response from the model. Try again?";
+            let botResponse;
+            if (parsedText) {
+                botResponse = parsedText;
+            } else if (primaryCandidate) {
+                botResponse = "Unexpected response structure or empty candidates. Maybe it's rate-limited. Try later?";
+            } else {
+                console.error('Malformed response: ', JSON.stringify(response, null, 2));
+                botResponse = "Hmm, got an empty response from the model. Try again?";
             }
 
-            botResponse = wrapInlineCitations(botResponse);
+            botResponse = botResponse.trim();
+            const searchedSites = countGroundingChunks(primaryCandidate);
+
+            if (searchedSites > 0) {
+                botResponse = cleanGroundingCitations(botResponse);
+            }
 
             if (!isBotMention) {
                 const historyBuffer = ensureHistoryBuffer(userMessageHistory, historyKey, userId);
@@ -395,7 +485,8 @@ module.exports = {
             }
 
             const elapsed = Date.now() - startTime;
-            const finalTag = buildFinalTag(elapsed, result.usage);
+            const usage = response?.usageMetadata;
+            const finalTag = buildFinalTag(elapsed, usage, searchedSites);
             const chunks = createDiscordChunks(botResponse, finalTag);
 
             await sendChunkedReply(message, chunks, finalTag);
